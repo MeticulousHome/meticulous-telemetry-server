@@ -40,8 +40,8 @@ async fn upload(MultipartForm(form): MultipartForm<UploadDebugShotFile>, path: w
     let path: std::path::PathBuf = Path::new("./uploads").join(target);
     let mut shot_file = path.join(filename_from_date.clone());
     let mut config_file = shot_file.clone();
-    shot_file.add_extension(".csv.zstd");
-    config_file.add_extension(".json");
+    shot_file.add_extension("csv.zstd");
+    config_file.add_extension("json");
 
     if let Err(e) = fs::create_dir_all(&path) {
         eprintln!("Failed to create directory {}: {}", path.to_str().unwrap(), e);
