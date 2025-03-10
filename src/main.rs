@@ -11,7 +11,7 @@ use actix_multipart::form::{json::Json as MpJson, tempfile::TempFile};
 // Meticulous machine config is optional to be send with the debug shot file
 #[derive(Debug, Deserialize)]
 struct Metadata {
-    config: Option<serde_json::Value>,
+    config: serde_json::Value,
 }
 
 #[derive(Debug, MultipartForm)]
