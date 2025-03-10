@@ -1,14 +1,12 @@
 [package]
-name = "meticulous-telemetry-upload"
+name = "meticulous-telemetry-server"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 actix-multipart = "0.7.2"
-actix-ratelimit = "0.3.1"
 actix-web = "4"
 chrono = "0.4.40"
-futures-util = "0.3.31"
 regex = "1.11.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.140"
