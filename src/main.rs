@@ -53,14 +53,14 @@ async fn upload(MultipartForm(form): MultipartForm<UploadDebugShotFile>, path: w
         return Ok(HttpResponse::InternalServerError().body(format!("Failed to save file: {}", e)));
     }
 
-    if let Some(config) = form.json.0.config {
-        let json_string = config.to_string();
-        if let Err(e) = fs::write(config_file.clone(), json_string) {
-            eprintln!("Failed to save config {}:  {}",config_file.to_str().unwrap(), e);
-        } else {
-            println!("Wrote config file {}", config_file.to_str().unwrap())
-        }
+
+    let json_string = form.json.config.to_string();
+    if let Err(e) = fs::write(config_file.clone(), json_string) {
+        eprintln!("Failed to save config {}:  {}",config_file.to_str().unwrap(), e);
+    } else {
+        println!("Wrote config file {}", config_file.to_str().unwrap())
     }
+
 
     println!(
         "Uploaded file {}, with size: {}",
