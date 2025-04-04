@@ -36,7 +36,7 @@ async fn upload(MultipartForm(form): MultipartForm<UploadDebugShotFile>, path: w
 
     // We can never be fully sure that the client is not sending us a malicious filename
     // so we sanitize it by coming up with our own
-    let filename_from_date = Utc::now().format("%Y%m%y_%H%M%S").to_string();
+    let filename_from_date = Utc::now().format("%Y%m%d_%H%M%S").to_string();
     let path: std::path::PathBuf = Path::new("./uploads").join(target);
     let mut shot_file = path.join(filename_from_date.clone());
     let mut config_file = shot_file.clone();
