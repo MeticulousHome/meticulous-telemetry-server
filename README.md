@@ -9,9 +9,10 @@ Execution is done via docker / compose:
 
 ### Request format
 The server accepts request of this format:
+(as of 2025-06-18 the config is optional)
 ```
 export MACHINE_NAME=meticulousDevMimoja
 export FILE=./2025-01-29/17\:31\:53.shot.json.zst
-curl https://analytics.meticulousespresso.com/upload/${MACHINE_NAME} -F file=@${FILE} -F 'json={"config": {}};type=application/json'
+curl http://localhost:8080/upload/${MACHINE_NAME} -F file=@${FILE} -F 'json={"config": {}};type=application/json'
 ```
 Where the json::config field can contain arbitrary data as long as it is valid json
