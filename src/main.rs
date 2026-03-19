@@ -1,6 +1,7 @@
 #![feature(path_add_extension)]
 use actix_multipart::form::MultipartForm;
 use actix_multipart::form::{json::Json as MpJson, tempfile::TempFile};
+use actix_cors::Cors;
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, get, post, web};
 use chrono::prelude::*;
 use dotenv::from_filename;
@@ -331,7 +332,18 @@ async fn main() -> std::io::Result<()> {
     let app_state = web::Data::new(load_app_state()?);
 
     HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allowed_methods(vec!["GET", "POST", "OPTIONS"])
+            .allowed_headers(vec![
+                actix_web::http::header::AUTHORIZATION,
+                actix_web::http::header::CONTENT_TYPE,
+                actix_web::http::header::HeaderName::from_static("auth"),
+            ])
+            .max_age(86_400);
+
         App::new()
+            .wrap(cors)
             .app_data(app_state.clone())
             .service(auth_google)
             .service(validate_token)
