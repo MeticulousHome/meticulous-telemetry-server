@@ -63,12 +63,11 @@ struct ErrorResponse {
     error: String,
 }
 
-type ParsedEntriesByName = BTreeMap<String, BTreeMap<NaiveDate, Vec<ParsedEntry>>>;
+type ParsedEntriesByName = BTreeMap<String, BTreeMap<NaiveDate, Vec<String>>>;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ParsedEntry {
-    original: String,
     name: String,
     date: NaiveDate,
     time: NaiveTime,
@@ -84,7 +83,6 @@ fn parse_entry(s: &str) -> Option<ParsedEntry> {
     let time = NaiveTime::parse_from_str(time_str, "%H%M%S").ok()?;
 
     Some(ParsedEntry {
-        original: s.to_string(),
         name: name.to_string(),
         date,
         time,
@@ -466,7 +464,7 @@ fn insert_entry(grouped_entries: &mut ParsedEntriesByName, entry: &str) -> Optio
         .or_default()
         .entry(parsed_entry.date)
         .or_default()
-        .push(parsed_entry.clone());
+        .push(entry.to_string());
 
     Some(parsed_entry)
 }
