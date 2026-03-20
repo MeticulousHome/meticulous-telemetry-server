@@ -3,13 +3,14 @@ use actix_multipart::form::MultipartForm;
 use actix_multipart::form::{json::Json as MpJson, tempfile::TempFile};
 use actix_cors::Cors;
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, get, post, web};
-use chrono::prelude::*;
+use chrono::{NaiveDate, NaiveTime, prelude::*};
 use dotenv::from_filename;
 use google_oauth::{Client, GoogleAccessTokenPayload};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{env, fs, io, path::Path};
+use std::{collections::BTreeMap, env, fs, io, path::Path};
+use std::sync::RwLock;
 
 const ENV_FILE: &str = ".env";
 const JWT_SECRET_KEY: &str = "JWT_SECRET";
@@ -18,11 +19,11 @@ const JWT_SECRET_DEFAULT: &str = "local-dev-jwt-secret";
 const ALLOWED_DOMAINS_DEFAULT: &str = "meticuloushome.com,fffuego.com";
 const JWT_EXPIRATION_HOURS: i64 = 24;
 
-#[derive(Clone)]
 struct AppState {
     google_client: Client,
     jwt_secret: String,
     allowed_domains: Vec<String>,
+    uploads_index: RwLock<ParsedEntriesByName>,
 }
 
 // Meticulous machine config is optional to be send with the debug shot file
@@ -60,6 +61,35 @@ struct LocalAuthClaims {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+type ParsedEntriesByName = BTreeMap<String, BTreeMap<NaiveDate, Vec<ParsedEntry>>>;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct ParsedEntry {
+    original: String,
+    name: String,
+    date: NaiveDate,
+    time: NaiveTime,
+    extension: String,
+}
+
+fn parse_entry(s: &str) -> Option<ParsedEntry> {
+    let (name, rest) = s.split_once('/')?;
+    let (datetime_part, extension) = rest.split_once('.')?;
+    let (date_str, time_str) = datetime_part.split_once('_')?;
+
+    let date = NaiveDate::parse_from_str(date_str, "%Y%m%d").ok()?;
+    let time = NaiveTime::parse_from_str(time_str, "%H%M%S").ok()?;
+
+    Some(ParsedEntry {
+        original: s.to_string(),
+        name: name.to_string(),
+        date,
+        time,
+        extension: extension.to_string(),
+    })
 }
 
 #[post("/auth/google")]
@@ -105,6 +135,29 @@ async fn auth_google(
     Ok(HttpResponse::Ok().json(GoogleAuthResponse { auth_token, user }))
 }
 
+#[get("/available_machines")]
+async fn available_machines(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+) -> Result<HttpResponse, Error> {
+    let _user = match validate_auth_header(&request, &state.jwt_secret) {
+        Ok(user) => user,
+        Err(response) => return Ok(response),
+    };
+
+    let machines = match state.uploads_index.read() {
+        Ok(index) => index.keys().cloned().collect::<Vec<_>>(),
+        Err(err) => {
+            eprintln!("Failed to read uploads index: {err}");
+            return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Failed to read available machines".to_string(),
+            }));
+        }
+    };
+
+    Ok(HttpResponse::Ok().json(machines))
+}
+
 #[get("/auth/validate_token")]
 async fn validate_token(
     state: web::Data<AppState>,
@@ -120,6 +173,7 @@ async fn validate_token(
 
 #[post("/upload/{target}")]
 async fn upload(
+    state: web::Data<AppState>,
     MultipartForm(form): MultipartForm<UploadDebugShotFile>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, Error> {
@@ -137,7 +191,7 @@ async fn upload(
     // We can never be fully sure that the client is not sending us a malicious filename
     // so we sanitize it by coming up with our own
     let filename_from_date = Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let path: std::path::PathBuf = Path::new("./uploads").join(target);
+    let path: std::path::PathBuf = Path::new("./uploads").join(&target);
 
     let mut shot_file = path.join(filename_from_date.clone());
     let mut config_file = shot_file.clone();
@@ -202,6 +256,20 @@ async fn upload(
         form.file.size
     );
 
+    if let Some(file_name) = shot_file.file_name().and_then(|name| name.to_str()) {
+        let entry_name = format!("{target}/{file_name}");
+        let mut index = match state.uploads_index.write() {
+            Ok(index) => index,
+            Err(err) => {
+                eprintln!("Failed to update uploads index: {err}");
+                return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: "Failed to update uploads index".to_string(),
+                }));
+            }
+        };
+        let _ = insert_entry(&mut index, &entry_name);
+    }
+
     Ok(HttpResponse::Ok().body("File uploaded successfully"))
 }
 
@@ -220,11 +288,13 @@ fn load_app_state() -> io::Result<AppState> {
         ALLOWED_DOMAINS_DEFAULT,
     ));
     let jwt_secret = get_env_var_or_default(JWT_SECRET_KEY, JWT_SECRET_DEFAULT);
+    let uploads_index = RwLock::new(build_entry_index(list_upload_file_names()?));
 
     Ok(AppState {
         google_client: Client::new(""),
         jwt_secret,
         allowed_domains,
+        uploads_index,
     })
 }
 
@@ -326,6 +396,81 @@ fn validate_auth_header(
     })
 }
 
+fn list_upload_file_names() -> io::Result<Vec<String>> {
+    let uploads_root = Path::new("./uploads");
+    let mut file_names = Vec::new();
+    collect_upload_file_names(uploads_root, uploads_root, &mut file_names)?;
+    file_names.sort();
+    Ok(file_names)
+}
+
+fn collect_upload_file_names(
+    uploads_root: &Path,
+    current_path: &Path,
+    file_names: &mut Vec<String>,
+) -> io::Result<()> {
+    let entries = match fs::read_dir(current_path) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+
+        if file_type.is_dir() {
+            collect_upload_file_names(uploads_root, &path, file_names)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let Ok(relative_path) = path.strip_prefix(uploads_root) else {
+            continue;
+        };
+
+        let parts = relative_path
+            .iter()
+            .map(|component| component.to_str())
+            .collect::<Option<Vec<_>>>();
+        let Some(parts) = parts else {
+            continue;
+        };
+
+        file_names.push(parts.join("/"));
+    }
+
+    Ok(())
+}
+
+fn build_entry_index<I, S>(entries: I) -> ParsedEntriesByName
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut grouped_entries = BTreeMap::new();
+    for entry in entries {
+        let _ = insert_entry(&mut grouped_entries, entry.as_ref());
+    }
+    grouped_entries
+}
+
+fn insert_entry(grouped_entries: &mut ParsedEntriesByName, entry: &str) -> Option<ParsedEntry> {
+    let parsed_entry = parse_entry(entry)?;
+    grouped_entries
+        .entry(parsed_entry.name.clone())
+        .or_default()
+        .entry(parsed_entry.date)
+        .or_default()
+        .push(parsed_entry.clone());
+
+    Some(parsed_entry)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     println!("Telemetry server starting...");
@@ -346,6 +491,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .app_data(app_state.clone())
             .service(auth_google)
+            .service(available_machines)
             .service(validate_token)
             .service(upload)
     })
