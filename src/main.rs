@@ -451,7 +451,7 @@ async fn upload(
     // We can never be fully sure that the client is not sending us a malicious filename
     // so we sanitize it by coming up with our own
     let filename_from_date = Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let path: std::path::PathBuf = Path::new("./uploads").join(&target);
+    let path: std::path::PathBuf = Path::new(UPLOADS_ROOT).join(&target);
 
     let mut shot_file = path.join(filename_from_date.clone());
     let mut config_file = shot_file.clone();
@@ -517,7 +517,7 @@ async fn upload(
     );
 
     if let Some(entry_name) = shot_file
-        .strip_prefix(Path::new("./uploads"))
+        .strip_prefix(Path::new(UPLOADS_ROOT))
         .ok()
         .and_then(|relative_path| relative_path.to_str())
     {
@@ -762,7 +762,7 @@ fn content_disposition_header_value(filename: &str, skip_download: bool) -> Stri
 }
 
 fn list_upload_file_names() -> io::Result<Vec<String>> {
-    let uploads_root = Path::new("./uploads");
+    let uploads_root = Path::new(UPLOADS_ROOT);
     let mut file_names = Vec::new();
     collect_upload_file_names(uploads_root, uploads_root, &mut file_names)?;
     file_names.sort();
