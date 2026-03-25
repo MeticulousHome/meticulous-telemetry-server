@@ -1,7 +1,7 @@
 #![feature(path_add_extension)]
+use actix_cors::Cors;
 use actix_multipart::form::MultipartForm;
 use actix_multipart::form::{json::Json as MpJson, tempfile::TempFile};
-use actix_cors::Cors;
 use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, get, post, web};
 use chrono::{NaiveDate, NaiveTime, prelude::*};
 use dotenv::from_filename;
@@ -9,12 +9,13 @@ use google_oauth::{Client, GoogleAccessTokenPayload};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs, io,
-    path::Path,
+    path::{Path, PathBuf},
+    process::Command,
 };
-use std::sync::RwLock;
 
 const ENV_FILE: &str = ".env";
 const JWT_SECRET_KEY: &str = "JWT_SECRET";
@@ -22,6 +23,8 @@ const ALLOWED_DOMAINS_KEY: &str = "ALLOWED_DOMAINS";
 const JWT_SECRET_DEFAULT: &str = "local-dev-jwt-secret";
 const ALLOWED_DOMAINS_DEFAULT: &str = "meticuloushome.com,fffuego.com";
 const JWT_EXPIRATION_HOURS: i64 = 24;
+const UPLOADS_ROOT: &str = "./uploads";
+const DOWNLOAD_BATCH_TIMESTAMP_FORMAT: &str = "%Y_%m_%d:%H_%M_%S";
 
 struct AppState {
     google_client: Client,
@@ -75,6 +78,13 @@ struct FetchQuery {
     size: Option<isize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DownloadQuery {
+    files: Option<String>,
+    #[serde(rename = "skipDownload", default)]
+    skip_download: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct FetchResponse {
     items: Vec<String>,
@@ -93,6 +103,13 @@ struct ParsedEntry {
     date: NaiveDate,
     time: NaiveTime,
     extension: String,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadEntry {
+    relative_path: String,
+    absolute_path: PathBuf,
+    download_name: String,
 }
 
 fn parse_entry(s: &str) -> Option<ParsedEntry> {
@@ -305,7 +322,93 @@ fn parse_target_filter(raw_targets: Option<&str>) -> Result<Option<BTreeSet<Stri
     Ok(Some(targets))
 }
 
-fn parse_date_range(raw_date_range: Option<&str>) -> Result<Option<(NaiveDate, NaiveDate)>, String> {
+#[get("/download")]
+async fn download(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    query: web::Query<DownloadQuery>,
+) -> Result<HttpResponse, Error> {
+    let _user = match validate_auth_header(&request, &state.jwt_secret) {
+        Ok(user) => user,
+        Err(response) => return Ok(response),
+    };
+
+    let entries = match parse_download_entries(query.files.as_deref()) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Ok(HttpResponse::BadRequest().json(ErrorResponse { error }));
+        }
+    };
+
+    if let Some(missing_entry) = entries.iter().find(|entry| !entry.absolute_path.is_file()) {
+        return Ok(HttpResponse::NotFound().json(ErrorResponse {
+            error: format!("Requested file not found: {}", missing_entry.relative_path),
+        }));
+    }
+
+    if entries.len() == 1 {
+        let entry = entries.into_iter().next().unwrap();
+        let read_path = entry.absolute_path;
+        let download_name = entry.download_name.clone();
+        let bytes = match web::block(move || fs::read(read_path)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(err)) => {
+                eprintln!("Failed to read requested file: {err}");
+                return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: "Failed to read requested file".to_string(),
+                }));
+            }
+            Err(err) => {
+                eprintln!("Failed to run file read in blocking task: {err}");
+                return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: "Failed to read requested file".to_string(),
+                }));
+            }
+        };
+
+        return Ok(HttpResponse::Ok()
+            .append_header((
+                "Content-Disposition",
+                content_disposition_header_value(&download_name, query.skip_download),
+            ))
+            .content_type("application/octet-stream")
+            .body(bytes));
+    }
+
+    let requested_paths = entries
+        .iter()
+        .map(|entry| entry.relative_path.clone())
+        .collect::<Vec<_>>();
+    let download_name = build_download_batch_name(Utc::now());
+    let archive_paths = requested_paths.clone();
+    let archive_bytes = match web::block(move || build_zip_archive(archive_paths)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) => {
+            eprintln!("Failed to create download archive: {err}");
+            return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Failed to create download archive".to_string(),
+            }));
+        }
+        Err(err) => {
+            eprintln!("Failed to run archive build in blocking task: {err}");
+            return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Failed to create download archive".to_string(),
+            }));
+        }
+    };
+
+    Ok(HttpResponse::Ok()
+        .append_header((
+            "Content-Disposition",
+            content_disposition_header_value(&download_name, query.skip_download),
+        ))
+        .content_type("application/zip")
+        .body(archive_bytes))
+}
+
+fn parse_date_range(
+    raw_date_range: Option<&str>,
+) -> Result<Option<(NaiveDate, NaiveDate)>, String> {
     let Some(raw_date_range) = raw_date_range else {
         return Ok(None);
     };
@@ -558,6 +661,113 @@ fn validate_auth_header(
     })
 }
 
+fn parse_download_entries(raw_files: Option<&str>) -> Result<Vec<DownloadEntry>, String> {
+    let Some(raw_files) = raw_files else {
+        return Err("Missing files parameter".to_string());
+    };
+
+    if raw_files.trim().is_empty() {
+        return Err("Missing files parameter".to_string());
+    }
+
+    let mut entries = Vec::new();
+    let mut seen_paths = BTreeSet::new();
+
+    for raw_path in raw_files.split(',').map(str::trim) {
+        if raw_path.is_empty() {
+            return Err("Invalid files parameter".to_string());
+        }
+
+        if !seen_paths.insert(raw_path.to_string()) {
+            continue;
+        }
+
+        entries.push(parse_download_entry(raw_path)?);
+    }
+
+    if entries.is_empty() {
+        return Err("Missing files parameter".to_string());
+    }
+
+    Ok(entries)
+}
+
+fn parse_download_entry(relative_path: &str) -> Result<DownloadEntry, String> {
+    if relative_path.contains('\\') {
+        return Err(format!("Invalid file path: {relative_path}"));
+    }
+
+    let mut parts = relative_path.split('/');
+    let Some(folder) = parts.next() else {
+        return Err(format!("Invalid file path: {relative_path}"));
+    };
+    let Some(filename) = parts.next() else {
+        return Err(format!("Invalid file path: {relative_path}"));
+    };
+
+    let target_pattern = Regex::new(r"^[A-Za-z0-9_-]+$").unwrap();
+    if parts.next().is_some()
+        || folder.is_empty()
+        || filename.is_empty()
+        || !target_pattern.is_match(folder)
+        || filename == "."
+        || filename == ".."
+    {
+        return Err(format!("Invalid file path: {relative_path}"));
+    }
+
+    Ok(DownloadEntry {
+        relative_path: format!("{folder}/{filename}"),
+        absolute_path: Path::new(UPLOADS_ROOT).join(folder).join(filename),
+        download_name: filename.to_string(),
+    })
+}
+
+fn build_download_batch_name(date_time: DateTime<Utc>) -> String {
+    format!(
+        "file_batch_{}.zip",
+        date_time.format(DOWNLOAD_BATCH_TIMESTAMP_FORMAT)
+    )
+}
+
+fn build_zip_archive(relative_paths: Vec<String>) -> io::Result<Vec<u8>> {
+    let archive_path = env::temp_dir().join(format!(
+        "meticulous-download-{}-{}.zip",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+
+    let status = Command::new("zip")
+        .current_dir(UPLOADS_ROOT)
+        .arg("-q")
+        .arg(&archive_path)
+        .args(&relative_paths)
+        .status()?;
+
+    if !status.success() {
+        let _ = fs::remove_file(&archive_path);
+        return Err(io::Error::other(format!(
+            "zip command failed with status {status}"
+        )));
+    }
+
+    let archive_bytes = fs::read(&archive_path);
+    let _ = fs::remove_file(&archive_path);
+    archive_bytes
+}
+
+fn content_disposition_header_value(filename: &str, skip_download: bool) -> String {
+    let disposition_type = if skip_download {
+        "inline"
+    } else {
+        "attachment"
+    };
+    format!(
+        "{disposition_type}; filename=\"{}\"",
+        filename.replace('"', "_")
+    )
+}
+
 fn list_upload_file_names() -> io::Result<Vec<String>> {
     let uploads_root = Path::new("./uploads");
     let mut file_names = Vec::new();
@@ -654,6 +864,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(app_state.clone())
             .service(auth_google)
             .service(available_machines)
+            .service(download)
             .service(fetch)
             .service(validate_token)
             .service(upload)
