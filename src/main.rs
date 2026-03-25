@@ -415,8 +415,11 @@ async fn upload(
         form.file.size
     );
 
-    if let Some(file_name) = shot_file.file_name().and_then(|name| name.to_str()) {
-        let entry_name = format!("{target}/{file_name}");
+    if let Some(entry_name) = shot_file
+        .strip_prefix(Path::new("./uploads"))
+        .ok()
+        .and_then(|relative_path| relative_path.to_str())
+    {
         let mut index = match state.uploads_index.write() {
             Ok(index) => index,
             Err(err) => {
@@ -426,7 +429,7 @@ async fn upload(
                 }));
             }
         };
-        let _ = insert_entry(&mut index, &entry_name);
+        let _ = insert_entry(&mut index, entry_name);
     }
 
     Ok(HttpResponse::Ok().body("File uploaded successfully"))
