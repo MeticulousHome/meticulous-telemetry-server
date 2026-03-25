@@ -2,7 +2,7 @@
 use actix_cors::Cors;
 use actix_multipart::form::MultipartForm;
 use actix_multipart::form::{json::Json as MpJson, tempfile::TempFile};
-use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, get, post, web};
+use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, get, http::Uri, post, web};
 use chrono::{NaiveDate, NaiveTime, prelude::*};
 use dotenv::from_filename;
 use google_oauth::{Client, GoogleAccessTokenPayload};
@@ -20,6 +20,7 @@ use std::{
 const ENV_FILE: &str = ".env";
 const JWT_SECRET_KEY: &str = "JWT_SECRET";
 const ALLOWED_DOMAINS_KEY: &str = "ALLOWED_DOMAINS";
+const ALLOWED_ORIGINS_KEY: &str = "ALLOWED_ORIGINS";
 const JWT_EXPIRATION_HOURS: i64 = 24;
 const UPLOADS_ROOT: &str = "./uploads";
 const DOWNLOAD_BATCH_TIMESTAMP_FORMAT: &str = "%Y_%m_%d:%H_%M_%S";
@@ -28,6 +29,7 @@ struct AppState {
     google_client: Client,
     jwt_secret: String,
     allowed_domains: Vec<String>,
+    allowed_origins: Vec<String>,
     uploads_index: RwLock<ParsedEntriesByName>,
 }
 
@@ -541,6 +543,7 @@ fn load_app_state() -> io::Result<AppState> {
         .map_err(|err| io::Error::other(format!("Failed to load {ENV_FILE}: {err}")))?;
 
     let allowed_domains = parse_allowed_domains(&get_required_env_var(ALLOWED_DOMAINS_KEY)?);
+    let allowed_origins = parse_allowed_origins(&get_required_env_var(ALLOWED_ORIGINS_KEY)?)?;
     let jwt_secret = get_required_env_var(JWT_SECRET_KEY)?;
     let uploads_index = RwLock::new(build_entry_index(list_upload_file_names()?));
 
@@ -548,6 +551,7 @@ fn load_app_state() -> io::Result<AppState> {
         google_client: Client::new(""),
         jwt_secret,
         allowed_domains,
+        allowed_origins,
         uploads_index,
     })
 }
@@ -573,6 +577,55 @@ fn parse_allowed_domains(raw_domains: &str) -> Vec<String> {
         .filter(|domain| !domain.is_empty())
         .map(|domain| domain.to_ascii_lowercase())
         .collect()
+}
+
+fn parse_allowed_origins(raw_origins: &str) -> io::Result<Vec<String>> {
+    let origins = raw_origins
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(normalize_allowed_origin)
+        .collect::<io::Result<Vec<_>>>()?;
+
+    if origins.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Environment variable {ALLOWED_ORIGINS_KEY} is empty"),
+        ));
+    }
+
+    Ok(origins)
+}
+
+fn normalize_allowed_origin(origin: &str) -> io::Result<String> {
+    let uri = origin.parse::<Uri>().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Invalid allowed origin {origin}: {err}"),
+        )
+    })?;
+
+    let scheme = uri.scheme_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Allowed origin is missing scheme: {origin}"),
+        )
+    })?;
+    let authority = uri.authority().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Allowed origin is missing host: {origin}"),
+        )
+    })?;
+
+    if uri.path() != "/" || uri.query().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Allowed origin must not include a path or query: {origin}"),
+        ));
+    }
+
+    Ok(format!("{scheme}://{authority}"))
 }
 
 fn is_allowed_email_domain(email: Option<&str>, allowed_domains: &[String]) -> bool {
@@ -842,8 +895,10 @@ async fn main() -> std::io::Result<()> {
     let app_state = web::Data::new(load_app_state()?);
 
     HttpServer::new(move || {
-        let cors = Cors::default()
-            .allow_any_origin()
+        let cors = app_state
+            .allowed_origins
+            .iter()
+            .fold(Cors::default(), |cors, origin| cors.allowed_origin(origin))
             .allowed_methods(vec!["GET", "POST", "OPTIONS"])
             .allowed_headers(vec![
                 actix_web::http::header::AUTHORIZATION,
