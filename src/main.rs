@@ -9,7 +9,11 @@ use google_oauth::{Client, GoogleAccessTokenPayload};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, fs, io, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs, io,
+    path::Path,
+};
 use std::sync::RwLock;
 
 const ENV_FILE: &str = ".env";
@@ -61,6 +65,23 @@ struct LocalAuthClaims {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchQuery {
+    target: Option<String>,
+    date_range: Option<String>,
+    page: Option<isize>,
+    size: Option<isize>,
+}
+
+#[derive(Debug, Serialize)]
+struct FetchResponse {
+    items: Vec<String>,
+    size: usize,
+    page: usize,
+    #[serde(rename = "hasNext")]
+    has_next: bool,
 }
 
 type ParsedEntriesByName = BTreeMap<String, BTreeMap<NaiveDate, Vec<String>>>;
@@ -167,6 +188,146 @@ async fn validate_token(
     };
 
     Ok(HttpResponse::Ok().json(user))
+}
+
+#[get("/fetch")]
+async fn fetch(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    query: web::Query<FetchQuery>,
+) -> Result<HttpResponse, Error> {
+    let _user = match validate_auth_header(&request, &state.jwt_secret) {
+        Ok(user) => user,
+        Err(response) => return Ok(response),
+    };
+
+    let target_filter = match parse_target_filter(query.target.as_deref()) {
+        Ok(target_filter) => target_filter,
+        Err(error) => {
+            return Ok(HttpResponse::BadRequest().json(ErrorResponse { error }));
+        }
+    };
+
+    let date_range = match parse_date_range(query.date_range.as_deref()) {
+        Ok(date_range) => date_range,
+        Err(error) => {
+            return Ok(HttpResponse::BadRequest().json(ErrorResponse { error }));
+        }
+    };
+
+    let final_list = match state.uploads_index.read() {
+        Ok(index) => {
+            let mut final_list = Vec::new();
+            for (name, dated_entries) in index.iter() {
+                if target_filter
+                    .as_ref()
+                    .is_some_and(|target_filter| !target_filter.contains(name))
+                {
+                    continue;
+                }
+
+                for (date, entries) in dated_entries {
+                    if date_range
+                        .as_ref()
+                        .is_some_and(|(start_date, end_date)| date < start_date || date > end_date)
+                    {
+                        continue;
+                    }
+
+                    final_list.extend(entries.iter().cloned());
+                }
+            }
+            final_list
+        }
+        Err(err) => {
+            eprintln!("Failed to read uploads index: {err}");
+            return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Failed to fetch machine files".to_string(),
+            }));
+        }
+    };
+
+    let page = normalize_query_pagination_value(query.page, 1);
+    let page_size = normalize_query_pagination_value(query.size, 50);
+    let starting_index = page.saturating_sub(1).saturating_mul(page_size);
+
+    if final_list.is_empty() || starting_index >= final_list.len() {
+        return Ok(HttpResponse::Ok().json(FetchResponse {
+            items: Vec::new(),
+            size: 0,
+            page,
+            has_next: false,
+        }));
+    }
+
+    let ending_index = page
+        .saturating_mul(page_size)
+        .saturating_sub(1)
+        .min(final_list.len() - 1);
+    let items = final_list[starting_index..ending_index + 1].to_vec();
+
+    Ok(HttpResponse::Ok().json(FetchResponse {
+        size: items.len(),
+        page,
+        has_next: ending_index < final_list.len() - 1,
+        items,
+    }))
+}
+
+fn normalize_query_pagination_value(value: Option<isize>, default_value: isize) -> usize {
+    value.unwrap_or(default_value).max(1) as usize
+}
+
+fn parse_target_filter(raw_targets: Option<&str>) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(raw_targets) = raw_targets else {
+        return Ok(None);
+    };
+
+    let targets = raw_targets
+        .split(',')
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    if targets.is_empty() {
+        return Ok(None);
+    }
+
+    let target_pattern = Regex::new(r"^[A-Za-z0-9_-]+$").unwrap();
+    if targets
+        .iter()
+        .any(|target| !target_pattern.is_match(target))
+    {
+        return Err("Invalid target parameter".to_string());
+    }
+
+    Ok(Some(targets))
+}
+
+fn parse_date_range(raw_date_range: Option<&str>) -> Result<Option<(NaiveDate, NaiveDate)>, String> {
+    let Some(raw_date_range) = raw_date_range else {
+        return Ok(None);
+    };
+
+    if raw_date_range.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let (start_date, end_date) = raw_date_range
+        .split_once(',')
+        .ok_or_else(|| "Invalid date_range parameter".to_string())?;
+
+    let start_date = NaiveDate::parse_from_str(start_date.trim(), "%Y%m%d")
+        .map_err(|_| "Invalid date_range parameter".to_string())?;
+    let end_date = NaiveDate::parse_from_str(end_date.trim(), "%Y%m%d")
+        .map_err(|_| "Invalid date_range parameter".to_string())?;
+
+    if start_date <= end_date {
+        Ok(Some((start_date, end_date)))
+    } else {
+        Ok(Some((end_date, start_date)))
+    }
 }
 
 #[post("/upload/{target}")]
@@ -490,6 +651,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(app_state.clone())
             .service(auth_google)
             .service(available_machines)
+            .service(fetch)
             .service(validate_token)
             .service(upload)
     })
