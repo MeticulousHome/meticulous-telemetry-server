@@ -20,8 +20,6 @@ use std::{
 const ENV_FILE: &str = ".env";
 const JWT_SECRET_KEY: &str = "JWT_SECRET";
 const ALLOWED_DOMAINS_KEY: &str = "ALLOWED_DOMAINS";
-const JWT_SECRET_DEFAULT: &str = "local-dev-jwt-secret";
-const ALLOWED_DOMAINS_DEFAULT: &str = "meticuloushome.com,fffuego.com";
 const JWT_EXPIRATION_HOURS: i64 = 24;
 const UPLOADS_ROOT: &str = "./uploads";
 const DOWNLOAD_BATCH_TIMESTAMP_FORMAT: &str = "%Y_%m_%d:%H_%M_%S";
@@ -539,20 +537,11 @@ async fn upload(
 }
 
 fn load_app_state() -> io::Result<AppState> {
-    if let Err(err) = from_filename(ENV_FILE) {
-        if !matches!(err.not_found(), true) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to load {ENV_FILE}: {err}"),
-            ));
-        }
-    }
+    from_filename(ENV_FILE)
+        .map_err(|err| io::Error::other(format!("Failed to load {ENV_FILE}: {err}")))?;
 
-    let allowed_domains = parse_allowed_domains(&get_env_var_or_default(
-        ALLOWED_DOMAINS_KEY,
-        ALLOWED_DOMAINS_DEFAULT,
-    ));
-    let jwt_secret = get_env_var_or_default(JWT_SECRET_KEY, JWT_SECRET_DEFAULT);
+    let allowed_domains = parse_allowed_domains(&get_required_env_var(ALLOWED_DOMAINS_KEY)?);
+    let jwt_secret = get_required_env_var(JWT_SECRET_KEY)?;
     let uploads_index = RwLock::new(build_entry_index(list_upload_file_names()?));
 
     Ok(AppState {
@@ -563,14 +552,18 @@ fn load_app_state() -> io::Result<AppState> {
     })
 }
 
-fn get_env_var_or_default(key: &str, default_value: &str) -> String {
-    if let Ok(value) = env::var(key) {
-        if !value.is_empty() {
-            return value;
-        }
+fn get_required_env_var(key: &str) -> io::Result<String> {
+    match env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Environment variable {key} is empty"),
+        )),
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Failed to read environment variable {key}: {err}"),
+        )),
     }
-
-    default_value.to_string()
 }
 
 fn parse_allowed_domains(raw_domains: &str) -> Vec<String> {
