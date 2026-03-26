@@ -79,6 +79,11 @@ struct FetchQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct AvailableMachinesQuery {
+    date_range: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DownloadQuery {
     files: Option<String>,
     #[serde(rename = "skipDownload", default)]
@@ -175,14 +180,32 @@ async fn auth_google(
 async fn available_machines(
     state: web::Data<AppState>,
     request: HttpRequest,
+    query: web::Query<AvailableMachinesQuery>,
 ) -> Result<HttpResponse, Error> {
     let _user = match validate_auth_header(&request, &state.jwt_secret) {
         Ok(user) => user,
         Err(response) => return Ok(response),
     };
 
+    let date_range = match parse_date_range(query.date_range.as_deref()) {
+        Ok(date_range) => date_range,
+        Err(error) => {
+            return Ok(HttpResponse::BadRequest().json(ErrorResponse { error }));
+        }
+    };
+
     let machines = match state.uploads_index.read() {
-        Ok(index) => index.keys().cloned().collect::<Vec<_>>(),
+        Ok(index) => index
+            .iter()
+            .filter(|(_, dated_entries)| {
+                date_range.as_ref().is_none_or(|(start_date, end_date)| {
+                    dated_entries
+                        .keys()
+                        .any(|date| date >= start_date && date <= end_date)
+                })
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>(),
         Err(err) => {
             eprintln!("Failed to read uploads index: {err}");
             return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
