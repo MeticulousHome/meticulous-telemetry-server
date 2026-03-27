@@ -12,6 +12,7 @@ use std::{
 use crate::{
     DOWNLOAD_BATCH_TIMESTAMP_FORMAT, UPLOADS_ROOT,
     auth::validate_auth_header,
+    fetching::{parse_date_range, parse_target_filter},
     is_valid_target,
     types::{
         AppState, DownloadEntry, DownloadQuery, ErrorResponse, ParsedEntriesByName, ParsedEntry,
@@ -34,12 +35,37 @@ async fn download(
         Err(response) => return Ok(response),
     };
 
-    let entries = match parse_download_entries(query.files.as_deref()) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return Ok(HttpResponse::BadRequest().json(ErrorResponse { error }));
+    let entries = if query.files.is_some() {
+        match resolve_download_entries_for_query(&query, None) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Ok(HttpResponse::BadRequest().json(ErrorResponse { error }));
+            }
+        }
+    } else {
+        let index = match state.uploads_index.read() {
+            Ok(index) => index,
+            Err(err) => {
+                eprintln!("Failed to read uploads index: {err}");
+                return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: "Failed to read uploads index".to_string(),
+                }));
+            }
+        };
+
+        match resolve_download_entries_for_query(&query, Some(&index)) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Ok(HttpResponse::BadRequest().json(ErrorResponse { error }));
+            }
         }
     };
+
+    if entries.is_empty() {
+        return Ok(HttpResponse::NotFound().json(ErrorResponse {
+            error: "No files matched requested criteria".to_string(),
+        }));
+    }
 
     if let Some(missing_entry) = entries.iter().find(|entry| !entry.absolute_path.is_file()) {
         return Ok(HttpResponse::NotFound().json(ErrorResponse {
@@ -243,6 +269,60 @@ pub(crate) fn parse_download_entries(
 
     if entries.is_empty() {
         return Err("Missing files parameter".to_string());
+    }
+
+    Ok(entries)
+}
+
+pub(crate) fn resolve_download_entries_for_query(
+    query: &DownloadQuery,
+    uploads_index: Option<&ParsedEntriesByName>,
+) -> Result<Vec<DownloadEntry>, String> {
+    if query.files.is_some() {
+        return parse_download_entries(query.files.as_deref());
+    }
+
+    let target_filter = parse_target_filter(query.target.as_deref())?;
+    let date_range = parse_date_range(query.date_range.as_deref())?;
+
+    if target_filter.is_none() && date_range.is_none() {
+        return Err("Missing files, target, or date_range parameter".to_string());
+    }
+
+    let Some(index) = uploads_index else {
+        return Err("Missing uploads index for target/date_range download query".to_string());
+    };
+
+    collect_download_entries_from_index(index, target_filter.as_ref(), date_range.as_ref())
+}
+
+fn collect_download_entries_from_index(
+    index: &ParsedEntriesByName,
+    target_filter: Option<&BTreeSet<String>>,
+    date_range: Option<&(chrono::NaiveDate, chrono::NaiveDate)>,
+) -> Result<Vec<DownloadEntry>, String> {
+    let mut entries = Vec::new();
+    let mut seen_paths = BTreeSet::new();
+
+    for (name, dated_entries) in index.iter() {
+        if target_filter.is_some_and(|target_filter| !target_filter.contains(name)) {
+            continue;
+        }
+
+        for (date, date_entries) in dated_entries {
+            if date_range.is_some_and(|(start_date, end_date)| date < start_date || date > end_date)
+            {
+                continue;
+            }
+
+            for entry in date_entries {
+                if !seen_paths.insert(entry.clone()) {
+                    continue;
+                }
+
+                entries.push(parse_download_entry(entry)?);
+            }
+        }
     }
 
     Ok(entries)

@@ -66,6 +66,8 @@ pub(crate) struct AvailableMachinesQuery {
 #[derive(Debug, Deserialize)]
 pub(crate) struct DownloadQuery {
     pub(crate) files: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) date_range: Option<String>,
     #[serde(rename = "skipDownload", default)]
     pub(crate) skip_download: bool,
 }
