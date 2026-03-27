@@ -1320,6 +1320,7 @@ dependencies = [
  "jsonwebtoken",
  "serde",
  "serde_json",
+ "zstd",
 ]
 
 [[package]]
