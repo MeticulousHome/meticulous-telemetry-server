@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    env, fs,
+    io::{self, Cursor},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -371,10 +372,15 @@ async fn download(
 
     if entries.len() == 1 {
         let entry = entries.into_iter().next().unwrap();
-        let read_path = entry.absolute_path;
         let download_name = entry.download_name.clone();
-        let bytes = match web::block(move || fs::read(read_path)).await {
-            Ok(Ok(bytes)) => bytes,
+        let read_path = entry.absolute_path;
+        let skip_download = query.skip_download;
+        let (bytes, response_file_name) = match web::block(move || {
+            read_download_payload(read_path, download_name, skip_download)
+        })
+        .await
+        {
+            Ok(Ok(payload)) => payload,
             Ok(Err(err)) => {
                 eprintln!("Failed to read requested file: {err}");
                 return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
@@ -392,7 +398,7 @@ async fn download(
         return Ok(HttpResponse::Ok()
             .append_header((
                 "Content-Disposition",
-                content_disposition_header_value(&download_name, query.skip_download),
+                content_disposition_header_value(&response_file_name, query.skip_download),
             ))
             .content_type("application/octet-stream")
             .body(bytes));
@@ -427,6 +433,41 @@ async fn download(
         ))
         .content_type("application/zip")
         .body(archive_bytes))
+}
+
+fn read_download_payload(
+    path: PathBuf,
+    download_name: String,
+    skip_download: bool,
+) -> io::Result<(Vec<u8>, String)> {
+    let file_bytes = fs::read(path)?;
+
+    if !skip_download || !is_zstd_file_name(&download_name) {
+        return Ok((file_bytes, download_name));
+    }
+
+    let decompressed_bytes = zstd::stream::decode_all(Cursor::new(file_bytes)).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to decompress requested file: {err}"),
+        )
+    })?;
+
+    Ok((
+        decompressed_bytes,
+        decompressed_download_name(&download_name).to_string(),
+    ))
+}
+
+fn is_zstd_file_name(file_name: &str) -> bool {
+    file_name.ends_with(".zstd") || file_name.ends_with(".zst")
+}
+
+fn decompressed_download_name(file_name: &str) -> &str {
+    file_name
+        .strip_suffix(".zstd")
+        .or_else(|| file_name.strip_suffix(".zst"))
+        .unwrap_or(file_name)
 }
 
 fn parse_date_range(
