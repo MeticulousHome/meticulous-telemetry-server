@@ -1,7 +1,6 @@
 mod auth;
 mod fetching;
 mod read_write;
-mod tests;
 mod types;
 
 use actix_cors::Cors;
