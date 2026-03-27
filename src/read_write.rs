@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::{self, Cursor},
+    io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -52,9 +52,8 @@ async fn download(
         let relative_path = entry.relative_path.clone();
         let download_name = entry.download_name.clone();
         let read_path = entry.absolute_path;
-        let skip_download = query.skip_download;
         let (bytes, response_file_name) = match web::block(move || {
-            read_download_payload(read_path, download_name, skip_download)
+            read_download_payload(read_path, download_name)
         })
         .await
         {
@@ -282,25 +281,10 @@ fn parse_download_entry(relative_path: &str) -> Result<DownloadEntry, String> {
 fn read_download_payload(
     path: PathBuf,
     download_name: String,
-    skip_download: bool,
 ) -> io::Result<(Vec<u8>, String)> {
     let file_bytes = fs::read(path)?;
 
-    if !skip_download || !is_zstd_file_name(&download_name) {
-        return Ok((file_bytes, download_name));
-    }
-
-    let decompressed_bytes = zstd::stream::decode_all(Cursor::new(file_bytes)).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Failed to decompress requested file: {err}"),
-        )
-    })?;
-
-    Ok((
-        decompressed_bytes,
-        decompressed_download_name(&download_name).to_string(),
-    ))
+    return Ok((file_bytes, download_name));
 }
 
 pub(crate) fn build_download_batch_name(date_time: DateTime<Utc>) -> String {
@@ -346,17 +330,6 @@ pub(crate) fn content_disposition_header_value(filename: &str, skip_download: bo
         "{disposition_type}; filename=\"{}\"",
         filename.replace('"', "_")
     )
-}
-
-fn is_zstd_file_name(file_name: &str) -> bool {
-    file_name.ends_with(".zstd") || file_name.ends_with(".zst")
-}
-
-pub(crate) fn decompressed_download_name(file_name: &str) -> &str {
-    file_name
-        .strip_suffix(".zstd")
-        .or_else(|| file_name.strip_suffix(".zst"))
-        .unwrap_or(file_name)
 }
 
 pub(crate) fn list_upload_file_names() -> io::Result<Vec<String>> {
