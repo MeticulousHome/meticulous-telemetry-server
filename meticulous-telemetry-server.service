@@ -6,7 +6,7 @@ After=nginx.service
 [Service]
 EnvironmentFile=/opt/telemetry-service/env
 ExecStartPre=-/bin/bash -c 'if [[ -z "$TELEMETRY_SERVER_PATH" ]] && echo "TELEMETRY_SERVER_PATH not found" && exit 10;'
-ExecStart=docker compose -f "${TELEMETRY_SERVER_PATH}/docker-compose.yml" up --wait
+ExecStart=docker compose -f "${TELEMETRY_SERVER_PATH}/docker-compose.yml" up
 ExecStop=docker compose -f "${TELEMETRY_SERVER_PATH}/docker-compose.yml" down
 Restart=always
 RestartSec=10

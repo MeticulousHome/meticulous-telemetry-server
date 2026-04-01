@@ -129,6 +129,14 @@ fi
 if [[ START_SERVICE -eq 1 ]]; then
   print_header "starting $SERVICE_NAME"
   use_sudo systemctl start $SERVICE_NAME
+else
+  if [[ INSTALL_SERVICE -eq 1 ]];then
+    print_header "You can manually start the service running"
+    print_message "systemctl start meticulous-telemetry-server.service" ">>>"
+  else
+    print_header "You can manually start the service running"
+    print_message "docker compose -f $TELEMETRY_SERVER_DIR/docker-compose.yml up --wait" ">>>"
+  fi
 fi
 
 print_header "DONE"
